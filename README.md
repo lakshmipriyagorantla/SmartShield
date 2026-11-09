@@ -24,6 +24,8 @@ SmartShield is a senior-friendly web application designed to help older adults l
 - Tailwind CSS
 - React Router
 - Lucide React icons
+- Python Flask API
+- SQLite for local development
 
 ## Installation
 
@@ -31,13 +33,45 @@ SmartShield is a senior-friendly web application designed to help older adults l
 npm install
 ```
 
-## Running the app
+Install the backend dependencies in a virtual environment:
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## Running locally
+
+Start the Flask API in one terminal:
+
+```bash
+.venv\Scripts\activate
+python -m flask --app backend.app run --debug --host 127.0.0.1 --port 5001
+```
+
+Start the frontend in a second terminal:
 
 ```bash
 npm run dev
 ```
 
-Then open the local URL shown in the terminal.
+The Vite development server proxies `/api` requests to Flask. The backend initializes missing SQLite tables without replacing existing records.
+Restart the Flask command after changing API or quiz content; the debug option
+reloads the backend when source files change.
+If an older Flask process is already listening on port 5001, stop it in its
+original terminal with Ctrl+C before starting the updated backend so it does not
+continue serving a stale quiz response.
+
+To start the existing Flask backend and Vite frontend together, wait for the
+quiz API to be ready, and keep both running in one terminal, use:
+
+```bash
+npm run dev:stack
+```
+
+Stop both servers with Ctrl+C. This command uses the existing Flask port 5001
+and lets Vite choose its normal available development port.
 
 ## Project Structure
 
@@ -59,7 +93,7 @@ src/
 
 - Connect a real AI fraud detection API
 - Add Android/iOS app integration for call and SMS detection
-- Add secure backend and database for logs and user profiles
+- Use a persistent managed database for production progress and quiz history
 - Improve voice understanding with real natural language processing
 - Add multilingual voice support and accessibility enhancements
 
@@ -82,21 +116,32 @@ Then replace the mock logic in the service files with API calls that validate in
 
 ## Deployment
 
-This app can be deployed to:
+Vercel builds the frontend into `dist` and serves the Flask API through `api/index.py`. The frontend uses same-origin API URLs; `VITE_API_BASE_URL` is only needed if the API is hosted on a different origin.
 
-- Vercel
+Vercel's function filesystem is temporary. The API uses `/tmp/smart_shield.db` there and serves authored lesson and quiz content from `backend/learning_content.py` if SQLite is missing or unavailable. Browser lesson progress remains in that device's local storage. For durable quiz attempts and server-side progress shared across devices, migrate SQLite to a managed PostgreSQL database before relying on those records in production; do not use the bundled SQLite file as persistent Vercel storage.
+
+Deploy from the project root using the Vercel CLI:
+
+```bash
+npx vercel
+npx vercel --prod
+```
+
+Alternatively, connect the Git repository to Vercel and redeploy the production branch after pushing the changes.
+
+The full-stack app can be deployed to:
+
+- Vercel (Vite frontend and Flask API)
 - Netlify
 - Firebase Hosting
-- Any static hosting service for Vite apps
+- Other static hosts when the Flask API is deployed separately
 
-Example:
+Build locally with:
 
 ```bash
 npm run build
 ```
 
-Then upload the generated `dist` folder to your hosting provider.
-
 ## Demo Notes
 
-This is a realistic front-end prototype. It uses mock data and does not send real emergency alerts or SMS messages unless a backend and authentication are connected.
+The smartphone lessons and cyber safety quiz use the Flask API and authored content. On Vercel, lesson progress is kept in the current browser and SQLite-backed server progress is temporary; use a managed database for durable, cross-device progress. Emergency alerts and SMS actions remain demonstrations and do not contact emergency services or send messages.

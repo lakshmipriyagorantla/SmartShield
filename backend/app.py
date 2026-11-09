@@ -16,6 +16,8 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from backend.learning_content import LESSONS, QUIZZES, VIDEO_RECORDS, LOCAL_VIDEO_MAPPINGS
+from backend.hindi_quiz_translations import HINDI_QUIZ_TEXT
+from backend.telugu_quiz_translations import TELUGU_QUIZ_TEXT
 from backend.ml.risk_engine import analyze_message, analyze_phone_number, analyze_url, report_scam
 
 
@@ -34,9 +36,26 @@ def load_local_env() -> None:
 load_local_env()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / 'smart_shield.db'
+DB_PATH = Path(
+    os.environ.get('SMARTSHIELD_DB_PATH')
+    or (
+        Path('/tmp') / 'smart_shield.db'
+        if os.environ.get('VERCEL') == '1'
+        else BASE_DIR / 'smart_shield.db'
+    )
+)
 _database_initialization_lock = Lock()
 _database_initialized = False
+REQUIRED_LEARNING_TABLES = {
+    'users',
+    'lessons',
+    'lesson_progress',
+    'quiz_sets',
+    'quiz_set_questions',
+    'quiz_attempts',
+    'quiz_results',
+}
+SUPPORTED_LANGUAGES = {'en', 'hi', 'te'}
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -53,13 +72,16 @@ def ensure_database() -> None:
         if not DB_PATH.exists():
             init_db()
         else:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            try:
                 tables = {
                     row[0] for row in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     ).fetchall()
                 }
-            if 'lessons' not in tables or 'quiz_sets' not in tables or 'video_tutorials' not in tables:
+            finally:
+                conn.close()
+            if not REQUIRED_LEARNING_TABLES.issubset(tables) or 'video_tutorials' not in tables:
                 init_db()
 
         migrate_learning_content()
@@ -173,7 +195,6 @@ def migrate_learning_content() -> None:
                     'INSERT INTO quiz_results (id, user_id, question_id, answer, correct, submitted_at) VALUES (?, ?, ?, ?, ?, ?)',
                     valid_results,
                 )
-                conn.execute('DROP TABLE quiz_results_legacy')
 
         conn.executescript(
             '''
@@ -268,19 +289,6 @@ def migrate_learning_content() -> None:
                 conn.execute(f'ALTER TABLE lessons ADD COLUMN {column} TEXT')
 
         existing_lessons = {row[0] for row in conn.execute('SELECT id FROM lessons')}
-        legacy_lesson_ids = {
-            'unlock-phone', 'make-phone-call', 'receive-phone-call', 'save-contact',
-            'send-sms', 'send-whatsapp-message', 'whatsapp-video-call', 'take-photo',
-            'connect-wifi', 'upi-safety',
-        }
-        legacy_progress = conn.execute(
-            'SELECT COUNT(*) FROM lesson_progress WHERE lesson_id IN ({})'.format(
-                ','.join('?' for _ in legacy_lesson_ids)
-            ),
-            tuple(legacy_lesson_ids),
-        ).fetchone()[0]
-        if legacy_progress == 0:
-            conn.executemany('DELETE FROM lessons WHERE id = ?', [(lesson_id,) for lesson_id in legacy_lesson_ids if lesson_id in existing_lessons])
         new_lessons = [lesson for lesson in LESSONS if lesson[0] not in existing_lessons]
         conn.executemany(
             'INSERT INTO lessons (id, category, difficulty, title_en, title_hi, title_te, description_en, description_hi, description_te, video_url, video_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -299,18 +307,23 @@ def migrate_learning_content() -> None:
                     (set_id, quiz['title']['en'], quiz['title']['hi'], quiz['title']['te'], quiz['description']['en'], quiz['description']['hi'], quiz['description']['te']),
                 )
 
-        existing_question_count = conn.execute('SELECT COUNT(*) FROM quiz_set_questions').fetchone()[0]
-        if existing_question_count == 0:
+        for quiz in QUIZZES:
+            existing_question_count = conn.execute(
+                'SELECT COUNT(*) FROM quiz_set_questions WHERE quiz_set_id = ?',
+                (quiz['slug'],),
+            ).fetchone()[0]
+            if existing_question_count:
+                continue
+
             questions = []
-            for quiz in QUIZZES:
-                for order, question in enumerate(quiz['questions'], 1):
-                    option_keys = ('A', 'B', 'C', 'D')
-                    options = question['options']
-                    row = [quiz['slug'], question['question']['en'], question['question']['hi'], question['question']['te']]
-                    for key in option_keys:
-                        row.extend([options['en'][option_keys.index(key)], options['hi'][option_keys.index(key)], options['te'][option_keys.index(key)]])
-                    row.extend([question['correct'], question['explanation']['en'], question['explanation']['hi'], question['explanation']['te']])
-                    questions.append(row)
+            for question in quiz['questions']:
+                option_keys = ('A', 'B', 'C', 'D')
+                options = question['options']
+                row = [quiz['slug'], question['question']['en'], question['question']['hi'], question['question']['te']]
+                for key in option_keys:
+                    row.extend([options['en'][option_keys.index(key)], options['hi'][option_keys.index(key)], options['te'][option_keys.index(key)]])
+                row.extend([question['correct'], question['explanation']['en'], question['explanation']['hi'], question['explanation']['te']])
+                questions.append(row)
             conn.executemany(
                 '''
                 INSERT INTO quiz_set_questions (
@@ -328,15 +341,6 @@ def migrate_learning_content() -> None:
         video_columns = {row[1] for row in conn.execute('PRAGMA table_info(video_tutorials)')}
         if 'related_quiz_set_id' not in video_columns:
             conn.execute('ALTER TABLE video_tutorials ADD COLUMN related_quiz_set_id TEXT')
-
-        desired_video_ids = {record[0] for record in VIDEO_RECORDS}
-        existing_video_ids = {row[0] for row in conn.execute('SELECT id FROM video_tutorials')}
-        stale_video_ids = existing_video_ids - desired_video_ids
-        if stale_video_ids:
-            placeholders = ','.join('?' for _ in stale_video_ids)
-            stale_ids = tuple(stale_video_ids)
-            conn.execute(f'DELETE FROM video_progress WHERE video_id IN ({placeholders})', stale_ids)
-            conn.execute(f'DELETE FROM video_tutorials WHERE id IN ({placeholders})', stale_ids)
 
         video_catalog = []
         seen = set()
@@ -404,10 +408,220 @@ def migrate_learning_content() -> None:
 
 
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA foreign_keys = ON')
     return conn
+
+
+def selected_language(language: str) -> str:
+    normalized = str(language or 'en').lower()
+    return normalized if normalized in SUPPORTED_LANGUAGES else 'en'
+
+
+def lessons_from_content(language: str) -> List[Dict[str, Any]]:
+    selected = selected_language(language)
+    lessons = []
+    for lesson in LESSONS:
+        (
+            lesson_id,
+            category,
+            difficulty,
+            title_en,
+            title_hi,
+            title_te,
+            description_en,
+            description_hi,
+            description_te,
+        ) = lesson
+        titles = {'en': title_en, 'hi': title_hi, 'te': title_te}
+        descriptions = {
+            'en': description_en,
+            'hi': description_hi,
+            'te': description_te,
+        }
+        lessons.append({
+            'id': lesson_id,
+            'category': category,
+            'difficulty': difficulty,
+            'title': titles[selected],
+            'description': descriptions[selected],
+            'language': selected,
+            'videoUrl': '',
+            'videoType': 'none',
+            'createdAt': None,
+        })
+    return lessons
+
+
+def quizzes_from_content(language: str) -> List[Dict[str, Any]]:
+    selected = selected_language(language)
+    question_id = 0
+    quizzes = []
+    for quiz in QUIZZES:
+        hindi_translation = HINDI_QUIZ_TEXT.get(quiz['slug'])
+        telugu_translation = TELUGU_QUIZ_TEXT.get(quiz['slug'])
+        for translation_language, translation in (
+            ('hi', hindi_translation),
+            ('te', telugu_translation),
+        ):
+            if selected == translation_language and (
+                translation is None
+                or len(translation['questions']) != len(quiz['questions'])
+            ):
+                raise ValueError(
+                    f"{translation_language.upper()} quiz translations are incomplete "
+                    f"for '{quiz['slug']}'."
+                )
+        if selected == 'hi' and hindi_translation:
+            hindi_values = [
+                hindi_translation['title'],
+                hindi_translation['description'],
+                *[
+                    text
+                    for question in hindi_translation['questions']
+                    for text in (question[0], *question[1], question[2])
+                ],
+            ]
+            if not all(is_complete_hindi_text(value) for value in hindi_values):
+                raise ValueError(
+                    f"Hindi quiz translations are incomplete for '{quiz['slug']}'."
+                )
+        questions = []
+        for index, question in enumerate(quiz['questions']):
+            question_id += 1
+            hindi_question = (
+                hindi_translation['questions'][index]
+                if hindi_translation
+                else None
+            )
+            telugu_question = (
+                telugu_translation['questions'][index]
+                if telugu_translation
+                else None
+            )
+            translated_question = {
+                'hi': hindi_question,
+                'te': telugu_question,
+            }.get(selected)
+            localized_question = (
+                translated_question[0]
+                if translated_question
+                else question['question'][selected]
+            )
+            localized_options = (
+                translated_question[1]
+                if translated_question
+                else question['options'][selected]
+            )
+            localized_explanation = (
+                translated_question[2]
+                if translated_question
+                else question['explanation'][selected]
+            )
+            question_languages = {
+                'en': question['question']['en'],
+                'hi': hindi_question[0] if hindi_question else question['question']['hi'],
+                'te': telugu_question[0] if telugu_question else question['question']['te'],
+            }
+            option_languages = {
+                'en': question['options']['en'],
+                'hi': hindi_question[1] if hindi_question else question['options']['hi'],
+                'te': telugu_question[1] if telugu_question else question['options']['te'],
+            }
+            explanation_languages = {
+                'en': question['explanation']['en'],
+                'hi': hindi_question[2] if hindi_question else question['explanation']['hi'],
+                'te': telugu_question[2] if telugu_question else question['explanation']['te'],
+            }
+            localized_questions = {
+                'id': question_id,
+                'question': localized_question,
+                'options': localized_options,
+                'correctOption': question['correct'],
+                'explanation': localized_explanation,
+            }
+            for language in ('en', 'hi', 'te'):
+                localized_questions[f'question_{language}'] = question_languages[language]
+                localized_questions[f'explanation_{language}'] = explanation_languages[language]
+                for option_index, option_key in enumerate(('A', 'B', 'C', 'D')):
+                    localized_questions[f'option_{option_key}_{language}'] = option_languages[language][option_index]
+            questions.append(localized_questions)
+        quizzes.append({
+            'id': quiz['slug'],
+            'title': (
+                hindi_translation['title']
+                if selected == 'hi' and hindi_translation
+                else telugu_translation['title']
+                if selected == 'te' and telugu_translation
+                else quiz['title'][selected]
+            ),
+            'description': (
+                hindi_translation['description']
+                if selected == 'hi' and hindi_translation
+                else telugu_translation['description']
+                if selected == 'te' and telugu_translation
+                else quiz['description'][selected]
+            ),
+            'title_en': quiz['title']['en'],
+            'title_hi': hindi_translation['title'] if hindi_translation else quiz['title']['hi'],
+            'title_te': telugu_translation['title'] if telugu_translation else quiz['title']['te'],
+            'description_en': quiz['description']['en'],
+            'description_hi': hindi_translation['description'] if hindi_translation else quiz['description']['hi'],
+            'description_te': telugu_translation['description'] if telugu_translation else quiz['description']['te'],
+            'language': selected,
+            'questions': questions,
+        })
+    return quizzes
+
+
+def is_complete_telugu_text(value: Any) -> bool:
+    text = str(value or '')
+    text_without_allowed_abbreviations = re.sub(r'\b(?:OTP|UPI)\b', '', text)
+    return bool(re.search(r'[\u0c00-\u0c7f]', text)) and not re.search(
+        r'[A-Za-z]',
+        text_without_allowed_abbreviations,
+    )
+
+
+def is_complete_hindi_text(value: Any) -> bool:
+    text = str(value or '')
+    text_without_allowed_terms = re.sub(
+        r'\b(?:OTP|UPI|PIN|SMS|Wi-?Fi|QR|SIM|GPS|USB|URL|HTTPS|Android|'
+        r'iPhone|Google|WhatsApp|Facebook|Instagram|YouTube|Bluetooth|PDF|'
+        r'Aadhaar|NFC|ATM|GooglePay|Paytm)\b',
+        '',
+        text,
+        flags=re.IGNORECASE,
+    )
+    return bool(re.search(r'[\u0900-\u097f]', text)) and not re.search(
+        r'[A-Za-z]',
+        text_without_allowed_terms,
+    )
+
+
+def content_fallback_response(payload: Any):
+    response = jsonify(payload)
+    response.headers['X-SmartShield-Content-Source'] = 'backend.learning_content'
+    response.headers['X-SmartShield-Storage'] = 'unavailable'
+    return response
+
+
+def database_storage_status() -> Dict[str, Any]:
+    is_vercel = os.environ.get('VERCEL') == '1'
+    return {
+        'storage': 'temporary-sqlite' if is_vercel else 'sqlite',
+        'durable': not is_vercel,
+    }
+
+
+def report_database_fallback(endpoint: str, error: sqlite3.Error) -> None:
+    app.logger.warning(
+        'SQLite unavailable for %s; serving learning_content fallback: %s',
+        endpoint,
+        error,
+    )
 
 
 def ensure_user(conn: sqlite3.Connection, user_id: int) -> None:
@@ -693,7 +907,10 @@ def seed_data(conn: sqlite3.Connection) -> None:
 
 @app.before_request
 def ensure_db_ready():
-    ensure_database()
+    try:
+        ensure_database()
+    except sqlite3.Error:
+        app.logger.exception('Unable to initialize the SQLite database for this request.')
 
 
 @app.after_request
@@ -701,12 +918,17 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, PUT, DELETE'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    response.headers.setdefault('X-SmartShield-Storage', database_storage_status()['storage'])
     return response
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'database': str(DB_PATH)})
+    return jsonify({
+        'status': 'ok',
+        'database': str(DB_PATH),
+        **database_storage_status(),
+    })
 
 
 @app.route('/api/users', methods=['POST'])
@@ -726,15 +948,25 @@ def create_user():
 
 @app.route('/api/lessons', methods=['GET'])
 def get_lessons():
-    language = request.args.get('language', 'en').lower()
-    conn = get_db_connection()
-    rows = conn.execute('SELECT * FROM lessons ORDER BY id').fetchall()
-    conn.close()
+    language = selected_language(request.args.get('language', 'en'))
+    conn = None
+    try:
+        conn = get_db_connection()
+        rows = conn.execute('SELECT * FROM lessons ORDER BY id').fetchall()
+    except sqlite3.Error as error:
+        report_database_fallback('/api/lessons', error)
+        return content_fallback_response(lessons_from_content(language))
+    finally:
+        if conn is not None:
+            conn.close()
+    if not rows:
+        app.logger.warning('No lessons are present in SQLite; serving backend.learning_content.')
+        return content_fallback_response(lessons_from_content(language))
     return jsonify([serialize_lesson(row, language) for row in rows])
 
 
 def serialize_lesson(row: sqlite3.Row, language: str = 'en') -> Dict[str, Any]:
-    selected = language if language in {'en', 'hi', 'te'} else 'en'
+    selected = selected_language(language)
     title_key = f'title_{selected}'
     description_key = f'description_{selected}'
     return {
@@ -752,47 +984,123 @@ def serialize_lesson(row: sqlite3.Row, language: str = 'en') -> Dict[str, Any]:
 
 @app.route('/api/lessons/<lesson_id>', methods=['GET'])
 def get_lesson(lesson_id):
-    conn = get_db_connection()
-    row = conn.execute('SELECT * FROM lessons WHERE id = ?', (lesson_id,)).fetchone()
-    conn.close()
+    conn = None
+    try:
+        conn = get_db_connection()
+        row = conn.execute('SELECT * FROM lessons WHERE id = ?', (lesson_id,)).fetchone()
+    except sqlite3.Error as error:
+        lesson = next((item for item in lessons_from_content('en') if item['id'] == lesson_id), None)
+        if lesson is None:
+            return jsonify({'error': 'Lesson was not found.'}), 404
+        report_database_fallback('/api/lessons/<lesson_id>', error)
+        return content_fallback_response(lesson)
+    finally:
+        if conn is not None:
+            conn.close()
     if row is None:
-        return jsonify({'error': 'Lesson was not found.'}), 404
+        lesson = next((item for item in lessons_from_content('en') if item['id'] == lesson_id), None)
+        if lesson is None:
+            return jsonify({'error': 'Lesson was not found.'}), 404
+        return content_fallback_response(lesson)
     return jsonify(dict(row))
 
 
 @app.route('/api/lessons/<lesson_id>/complete', methods=['POST'])
 def complete_lesson(lesson_id):
     data = request.get_json(silent=True) or {}
-    user_id = data.get('user_id') or 1
-    if not user_id:
-        return jsonify({'error': 'Please provide a user id.'}), 400
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object.'}), 400
+    try:
+        user_id = int(data.get('user_id') or 1)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Please provide a valid user id.'}), 400
+    if user_id < 1:
+        return jsonify({'error': 'Please provide a valid user id.'}), 400
 
-    conn = get_db_connection()
-    lesson_exists = conn.execute('SELECT 1 FROM lessons WHERE id = ?', (lesson_id,)).fetchone()
+    conn = None
+    try:
+        conn = get_db_connection()
+        lesson_exists = conn.execute('SELECT 1 FROM lessons WHERE id = ?', (lesson_id,)).fetchone()
+    except sqlite3.Error as error:
+        if conn is not None:
+            conn.close()
+        if not any(item['id'] == lesson_id for item in lessons_from_content('en')):
+            return jsonify({'error': 'Lesson not found.'}), 404
+        report_database_fallback('/api/lessons/<lesson_id>/complete', error)
+        return content_fallback_response({
+            'message': 'Lesson marked complete for this browser session; database progress was not saved.',
+            'persisted': False,
+            'storage': 'unavailable',
+            'durable': False,
+            'progress': {
+                'user_id': user_id,
+                'total_lessons': len(LESSONS),
+                'completed_lessons': 1,
+                'lessonPercentage': round(100 / len(LESSONS)) if LESSONS else 0,
+                'percentage': round(100 / len(LESSONS)) if LESSONS else 0,
+                'totalQuizSets': len(QUIZZES),
+                'completedQuizSets': 0,
+                'quizPercentage': 0,
+                'totalQuizQuestions': sum(len(quiz['questions']) for quiz in QUIZZES),
+                'completed_lesson_ids': [lesson_id],
+                'persistenceAvailable': False,
+            },
+        })
     if lesson_exists is None:
         conn.close()
-        return jsonify({'error': 'Lesson not found.'}), 404
+        if not any(item['id'] == lesson_id for item in lessons_from_content('en')):
+            return jsonify({'error': 'Lesson not found.'}), 404
+        return content_fallback_response({
+            'message': 'Lesson is available from the learning content but not stored in SQLite.',
+            'persisted': False,
+            'storage': 'unavailable',
+            'durable': False,
+            'progress': {
+                'user_id': user_id,
+                'total_lessons': len(LESSONS),
+                'completed_lessons': 0,
+                'lessonPercentage': 0,
+                'percentage': 0,
+                'completed_lesson_ids': [],
+                'persistenceAvailable': False,
+            },
+        })
 
-    ensure_user(conn, user_id)
-    existing = conn.execute(
-        'SELECT id FROM lesson_progress WHERE user_id = ? AND lesson_id = ?',
-        (user_id, lesson_id),
-    ).fetchone()
-    if existing is None:
-        conn.execute(
-            'INSERT INTO lesson_progress (user_id, lesson_id, completed, completed_at) VALUES (?, ?, 1, ?)',
-            (user_id, lesson_id, datetime.utcnow().isoformat(timespec='seconds')),
-        )
-    else:
-        conn.execute(
-            'UPDATE lesson_progress SET completed = 1, completed_at = ? WHERE user_id = ? AND lesson_id = ?',
-            (datetime.utcnow().isoformat(timespec='seconds'), user_id, lesson_id),
-        )
-    conn.commit()
-    progress = get_user_progress(conn, user_id)
-    conn.close()
+    try:
+        ensure_user(conn, user_id)
+        existing = conn.execute(
+            'SELECT id FROM lesson_progress WHERE user_id = ? AND lesson_id = ?',
+            (user_id, lesson_id),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                'INSERT INTO lesson_progress (user_id, lesson_id, completed, completed_at) VALUES (?, ?, 1, ?)',
+                (user_id, lesson_id, datetime.utcnow().isoformat(timespec='seconds')),
+            )
+        else:
+            conn.execute(
+                'UPDATE lesson_progress SET completed = 1, completed_at = ? WHERE user_id = ? AND lesson_id = ?',
+                (datetime.utcnow().isoformat(timespec='seconds'), user_id, lesson_id),
+            )
+        conn.commit()
+        progress = get_user_progress(conn, user_id)
+    except sqlite3.Error as error:
+        conn.rollback()
+        report_database_fallback('/api/lessons/<lesson_id>/complete', error)
+        response = jsonify({
+            'error': 'The lesson was not saved to SQLite. Your browser can still keep local progress.',
+            'persisted': False,
+            'storage': 'unavailable',
+            'durable': False,
+        })
+        response.headers['X-SmartShield-Storage'] = 'unavailable'
+        return response, 503
+    finally:
+        conn.close()
     return jsonify({
         'message': 'Lesson marked as complete.',
+        'persisted': True,
+        **database_storage_status(),
         'progress': progress,
     })
 
@@ -918,9 +1226,33 @@ def complete_video(video_id):
 
 @app.route('/api/users/<int:user_id>/progress', methods=['GET'])
 def user_progress(user_id):
-    conn = get_db_connection()
-    payload = get_user_progress(conn, user_id)
-    conn.close()
+    conn = None
+    fallback = False
+    try:
+        conn = get_db_connection()
+        payload = get_user_progress(conn, user_id)
+    except sqlite3.Error as error:
+        report_database_fallback('/api/users/<user_id>/progress', error)
+        fallback = True
+        total_questions = sum(len(quiz['questions']) for quiz in QUIZZES)
+        payload = {
+            'user_id': user_id,
+            'total_lessons': len(LESSONS),
+            'completed_lessons': 0,
+            'lessonPercentage': 0,
+            'percentage': 0,
+            'totalQuizSets': len(QUIZZES),
+            'completedQuizSets': 0,
+            'quizPercentage': 0,
+            'totalQuizQuestions': total_questions,
+            'completed_lesson_ids': [],
+            'persistenceAvailable': False,
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+    if fallback:
+        return content_fallback_response(payload)
     return jsonify(payload)
 
 
@@ -955,6 +1287,7 @@ def get_user_progress(conn: sqlite3.Connection, user_id: int) -> Dict[str, Any]:
                 (user_id,),
             ).fetchall()
         ],
+        **database_storage_status(),
     }
 
 
@@ -1317,65 +1650,231 @@ def safety_topics():
 
 @app.route('/api/quiz', methods=['GET'])
 def quiz_questions():
-    language = request.args.get('language', 'en').lower()
-    conn = get_db_connection()
-    sets = conn.execute(
-        'SELECT * FROM quiz_sets ORDER BY title_en'
-    ).fetchall()
+    language = selected_language(request.args.get('language', 'en'))
+    conn = None
     payload = []
-    for quiz_set in sets:
-        questions = conn.execute(
-            '''
-            SELECT * FROM quiz_set_questions
-            WHERE quiz_set_id = ? ORDER BY id
-            ''',
-            (quiz_set['id'],),
+    try:
+        authored_quizzes = {quiz['id']: quiz for quiz in quizzes_from_content(language)}
+    except ValueError as error:
+        app.logger.error('Quiz localization data is incomplete: %s', error)
+        return jsonify({'error': 'Quiz translations are incomplete.', 'details': str(error)}), 500
+    try:
+        conn = get_db_connection()
+        sets = conn.execute(
+            'SELECT * FROM quiz_sets ORDER BY title_en'
         ).fetchall()
-        payload.append({
-            'id': quiz_set['id'],
-            'title': quiz_set[f'title_{language}'] if language in {'en', 'hi', 'te'} else quiz_set['title_en'],
-            'description': quiz_set[f'description_{language}'] if language in {'en', 'hi', 'te'} else quiz_set['description_en'],
-            'language': language if language in {'en', 'hi', 'te'} else 'en',
-            'questions': [
-                {
-                    'id': question['id'],
-                    'question': question[f'question_{language}'] if language in {'en', 'hi', 'te'} else question['question_en'],
-                    'options': [question[f'option_{key.lower()}_{language}'] if language in {'en', 'hi', 'te'} else question[f'option_{key.lower()}_en'] for key in ('A', 'B', 'C', 'D')],
-                    'correctOption': question['correct_option'],
-                    'explanation': question[f'explanation_{language}'] if language in {'en', 'hi', 'te'} else question['explanation_en'],
+        for quiz_set in sets:
+            questions = conn.execute(
+                '''
+                SELECT * FROM quiz_set_questions
+                WHERE quiz_set_id = ? ORDER BY id
+                ''',
+                (quiz_set['id'],),
+            ).fetchall()
+            authored_quiz = authored_quizzes.get(quiz_set['id'])
+            if authored_quiz and not questions:
+                payload.append(authored_quiz)
+                continue
+            if authored_quiz and len(authored_quiz['questions']) != len(questions):
+                app.logger.error(
+                    'Quiz question count mismatch for %s: database=%s content=%s',
+                    quiz_set['id'],
+                    len(questions),
+                    len(authored_quiz['questions']),
+                )
+                return jsonify({
+                    'error': 'Quiz database records do not match the published learning content.',
+                    'quiz_set_id': quiz_set['id'],
+                }), 500
+            if authored_quiz:
+                payload.append({
+                    **authored_quiz,
+                    'questions': [
+                        {
+                            **authored_question,
+                            'id': question['id'],
+                            'correctOption': question['correct_option'],
+                        }
+                        for authored_question, question in zip(authored_quiz['questions'], questions)
+                    ],
+                })
+                continue
+            title = quiz_set[f'title_{language}']
+            description = quiz_set[f'description_{language}']
+            if (
+                not title
+                or not description
+                or (language == 'te' and not all(
+                    is_complete_telugu_text(value)
+                    for value in (title, description)
+                ))
+                or (language == 'hi' and not all(
+                    is_complete_hindi_text(value)
+                    for value in (title, description)
+                ))
+            ):
+                return jsonify({
+                    'error': f'{language.upper()} quiz set translation is missing.',
+                    'quiz_set_id': quiz_set['id'],
+                }), 500
+            localized_questions = []
+            for question in questions:
+                translated_values = {
+                    'question': question[f'question_{language}'],
+                    'explanation': question[f'explanation_{language}'],
+                    **{
+                        f'option_{key}': question[f'option_{key.lower()}_{language}']
+                        for key in ('A', 'B', 'C', 'D')
+                    },
                 }
-                for question in questions
-            ],
-        })
-    conn.close()
+                missing_fields = [field for field, value in translated_values.items() if not value]
+                if language in {'hi', 'te'}:
+                    is_complete_translation = (
+                        is_complete_hindi_text
+                        if language == 'hi'
+                        else is_complete_telugu_text
+                    )
+                    missing_fields.extend(
+                        field
+                        for field, value in translated_values.items()
+                        if field not in missing_fields and not is_complete_translation(value)
+                    )
+                if missing_fields:
+                    return jsonify({
+                        'error': f'{language.upper()} quiz question translation is missing.',
+                        'quiz_set_id': quiz_set['id'],
+                        'question_id': question['id'],
+                        'missing_fields': missing_fields,
+                    }), 500
+                localized_questions.append({
+                    'id': question['id'],
+                    'question': translated_values['question'],
+                    'question_en': question['question_en'],
+                    'question_hi': question['question_hi'],
+                    'question_te': question['question_te'],
+                    'options': [translated_values[f'option_{key}'] for key in ('A', 'B', 'C', 'D')],
+                    'correctOption': question['correct_option'],
+                    'explanation': translated_values['explanation'],
+                    'explanation_en': question['explanation_en'],
+                    'explanation_hi': question['explanation_hi'],
+                    'explanation_te': question['explanation_te'],
+                    **{
+                        f'option_{key}_{language_key}': question[f'option_{key.lower()}_{language_key}']
+                        for key in ('A', 'B', 'C', 'D')
+                        for language_key in ('en', 'hi', 'te')
+                    },
+                })
+            payload.append({
+                'id': quiz_set['id'],
+                'title': title,
+                'description': description,
+                'title_en': quiz_set['title_en'],
+                'title_hi': quiz_set['title_hi'],
+                'title_te': quiz_set['title_te'],
+                'description_en': quiz_set['description_en'],
+                'description_hi': quiz_set['description_hi'],
+                'description_te': quiz_set['description_te'],
+                'language': language,
+                'questions': localized_questions,
+            })
+    except sqlite3.Error as error:
+        report_database_fallback('/api/quiz', error)
+        return content_fallback_response(quizzes_from_content(language))
+    finally:
+        if conn is not None:
+            conn.close()
+    if not payload or any(not quiz['questions'] for quiz in payload):
+        app.logger.warning('Quiz sets or questions are missing from SQLite; serving backend.learning_content.')
+        return content_fallback_response(quizzes_from_content(language))
     return jsonify(payload)
+
+
+def score_quiz_from_content(quiz_set_id: str, answers: List[Dict[str, Any]]):
+    quiz = next((item for item in quizzes_from_content('en') if item['id'] == quiz_set_id), None)
+    if quiz is None:
+        return jsonify({'error': 'Quiz set was not found.'}), 404
+
+    answer_ids = [str(item.get('question_id') or '') for item in answers]
+    if any(not question_id for question_id in answer_ids):
+        return jsonify({'error': 'Each answer must include a question id.'}), 400
+    if len(answer_ids) != len(set(answer_ids)):
+        return jsonify({'error': 'Each question can be answered only once.'}), 400
+    if len(answer_ids) != len(quiz['questions']):
+        return jsonify({'error': f"Please answer all {len(quiz['questions'])} questions."}), 400
+
+    if any(str(item.get('answer') or '').strip().upper() not in {'A', 'B', 'C', 'D'} for item in answers):
+        return jsonify({'error': 'Each answer must be A, B, C, or D.'}), 400
+
+    correct_answers = {
+        str(question['id']): question['correctOption']
+        for question in quiz['questions']
+    }
+    if set(answer_ids) == set(correct_answers):
+        score = sum(
+            str(item.get('answer')).strip().upper()
+            == correct_answers[str(item['question_id'])]
+            for item in answers
+        )
+    else:
+        score = sum(
+            str(item.get('answer')).strip().upper() == question['correctOption']
+            for item, question in zip(answers, quiz['questions'])
+        )
+    total = len(answers)
+    return content_fallback_response({
+        'attemptId': None,
+        'quizSetId': quiz_set_id,
+        'score': score,
+        'total': total,
+        'percentage': round((score / total) * 100) if total else 0,
+        'progress': None,
+        'persisted': False,
+        'storage': 'unavailable',
+        'durable': False,
+        'message': 'The score was calculated from learning content; database progress was not saved.',
+    })
 
 
 @app.route('/api/quiz/submit', methods=['POST'])
 def submit_quiz():
     payload = request.get_json(silent=True) or {}
-    user_id = payload.get('user_id') or 1
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'The request body must be a JSON object.'}), 400
+    try:
+        user_id = int(payload.get('user_id') or 1)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Please provide a valid user id.'}), 400
+    if user_id < 1:
+        return jsonify({'error': 'Please provide a valid user id.'}), 400
     quiz_set_id = str(payload.get('quiz_set_id') or '').strip()
     answers = payload.get('answers') or []
     if not quiz_set_id:
         return jsonify({'error': 'Please provide a quiz set id.'}), 400
     if not isinstance(answers, list) or not answers:
         return jsonify({'error': 'Please provide quiz answers.'}), 400
+    if any(not isinstance(item, dict) for item in answers):
+        return jsonify({'error': 'Each quiz answer must be a JSON object.'}), 400
 
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
         quiz_exists = conn.execute(
             'SELECT 1 FROM quiz_sets WHERE id = ?',
             (quiz_set_id,),
         ).fetchone()
         if quiz_exists is None:
-            return jsonify({'error': 'Quiz set was not found.'}), 404
+            return score_quiz_from_content(quiz_set_id, answers)
 
-        question_ids = [
-            item.get('question_id')
-            for item in answers
-            if item.get('question_id')
-        ]
+        question_ids = [item.get('question_id') for item in answers]
+        if any(question_id is None for question_id in question_ids):
+            return jsonify({'error': 'Each answer must include a question id.'}), 400
+        if any(
+            isinstance(question_id, bool)
+            or not isinstance(question_id, (int, str))
+            for question_id in question_ids
+        ):
+            return jsonify({'error': 'Quiz question ids must be numbers or numeric strings.'}), 400
+        question_ids = [str(question_id) for question_id in question_ids]
         if len(question_ids) != len(set(question_ids)):
             return jsonify({'error': 'Each question can be answered only once.'}), 400
 
@@ -1383,13 +1882,15 @@ def submit_quiz():
             'SELECT COUNT(*) FROM quiz_set_questions WHERE quiz_set_id = ?',
             (quiz_set_id,),
         ).fetchone()[0]
+        if expected_count == 0:
+            return score_quiz_from_content(quiz_set_id, answers)
         if len(question_ids) != expected_count:
             return jsonify({'error': f'Please answer all {expected_count} questions.'}), 400
 
         ensure_user(conn, user_id)
         score = 0
         for item in answers:
-            question_id = item.get('question_id')
+            question_id = str(item.get('question_id'))
             answer = str(item.get('answer') or '').strip().upper()
             row = conn.execute(
                 'SELECT correct_option FROM quiz_set_questions WHERE id = ? AND quiz_set_id = ?',
@@ -1419,13 +1920,22 @@ def submit_quiz():
             'score': score,
             'total': total,
             'percentage': percentage,
+            'persisted': True,
+            **database_storage_status(),
             'progress': progress,
         })
+    except sqlite3.Error as error:
+        if conn is not None:
+            conn.rollback()
+        report_database_fallback('/api/quiz/submit', error)
+        return score_quiz_from_content(quiz_set_id, answers)
     except Exception:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
         raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 @app.route('/api/users/<int:user_id>/quiz-results', methods=['GET'])

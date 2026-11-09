@@ -1,0 +1,66 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.py"
+    },
+    {
+      "source": "/scam-detector",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/learn-smartphone",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/tutorial/:id",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/video-tutorials",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/video-tutorials/:id",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/upi-qr-safety",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/voice-assistant",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/emergency-sos",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/emergency-contacts",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/cyber-safety",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/privacy-safety",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/quiz",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/feedback",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/settings",
+      "destination": "/index.html"
+    }
+  ]
+}

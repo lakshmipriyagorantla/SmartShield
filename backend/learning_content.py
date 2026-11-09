@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from backend.telugu_quiz_translations import TELUGU_QUIZ_TEXT
 
-def q(en, hi, te, oa, ob, oc, od, correct, ex_en, ex_hi, ex_te):
+
+def q(en, hi, _te, oa, ob, oc, od, correct, ex_en, ex_hi, _ex_te):
     return {
-        "question": {"en": en, "hi": hi, "te": te},
-        "options": {"en": [oa, ob, oc, od], "hi": [oa, ob, oc, od], "te": [oa, ob, oc, od]},
+        "question": {"en": en, "hi": hi},
+        "options": {"en": [oa, ob, oc, od], "hi": [oa, ob, oc, od]},
         "correct": correct,
-        "explanation": {"en": ex_en, "hi": ex_hi, "te": ex_te},
+        "explanation": {"en": ex_en, "hi": ex_hi},
     }
 
 
@@ -171,6 +173,18 @@ QUIZZES = [
         q("What should you do if a scammer contacts you?","स्कैमर_contact করার पर क्या करें?","స్కామ్‌ర్ని మీకు సంప్రదిస్తే ఏమి చేయాలి?","Block and report the contact","Share the OTP","Send money","Reply immediately","A","Block and report the contact, then secure your accounts.","संपर्क ब्लॉक और रिपोर्ट करें, फिर अपने खाते सुरक्षित करें।","contact block aur report karo, phir account secure karo."),
     ]},
 ]
+
+for quiz in QUIZZES:
+    translation = TELUGU_QUIZ_TEXT.get(quiz['slug'])
+    if translation is None or len(translation['questions']) != len(quiz['questions']):
+        raise RuntimeError(f"Telugu quiz translations are incomplete for '{quiz['slug']}'.")
+    quiz['title']['te'] = translation['title']
+    quiz['description']['te'] = translation['description']
+    for question, translated_question in zip(quiz['questions'], translation['questions']):
+        question['question']['te'] = translated_question[0]
+        question['options']['te'] = translated_question[1]
+        question['explanation']['te'] = translated_question[2]
+
 
 VIDEO_RECORDS = [
     ("lesson-video-01", "Smartphone Basics", "videoCategories.mobileSecurity", "Learning Video 01", "लर्निंग वीडियो 01", "లెర్నింగ్ వీడియో 01", "Smartphone learning video for safe and confident phone use.", "स्मार्टफोन सीखने के लिए सुरक्षित और आत्मविश्वासपूर्ण उपयोग वीडियो।", "స్మార్ట్‌ఫోన్‌ను సురక్షితంగా మరియు నమ్మకంగా ఉపయోగించేందుకు వీడియో.", "/videos/1.mp4", "/videos/1.mp4", "/videos/1.mp4", "https://images.unsplash.com/photo-1512941937669-90a1b58e7e9c?auto=format&fit=crop&w=1200&q=80", "02:30", 0),

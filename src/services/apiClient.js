@@ -1,9 +1,23 @@
-const DEFAULT_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5001'
+const DEFAULT_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
+
+async function readResponse(response) {
+  let data
+  try {
+    data = await response.json()
+  } catch {
+    throw new Error('The server returned an invalid response.')
+  }
+
+  if (!response.ok) {
+    throw new Error(data?.error || `Request failed: ${response.status}`)
+  }
+
+  return data
+}
 
 export const apiClient = {
   async get(url, options = {}) {
-    const baseUrl = DEFAULT_BASE_URL
-    const response = await fetch(`${baseUrl}${url}`, {
+    const response = await fetch(`${DEFAULT_BASE_URL}${url}`, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -12,16 +26,11 @@ export const apiClient = {
       ...options,
     })
 
-    if (!response.ok) {
-      throw new Error(`Request failed: ${response.status}`)
-    }
-
-    return response.json().catch(() => ({}))
+    return readResponse(response)
   },
 
   async post(url, body, options = {}) {
-    const baseUrl = DEFAULT_BASE_URL
-    const response = await fetch(`${baseUrl}${url}`, {
+    const response = await fetch(`${DEFAULT_BASE_URL}${url}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -31,14 +40,10 @@ export const apiClient = {
       ...options,
     })
 
-    if (!response.ok) {
-      throw new Error(`Request failed: ${response.status}`)
-    }
-
-    return response.json().catch(() => ({}))
+    return readResponse(response)
   },
 }
 
 export function getApiBaseUrl() {
-  return DEFAULT_BASE_URL || 'local-demo'
+  return DEFAULT_BASE_URL
 }
